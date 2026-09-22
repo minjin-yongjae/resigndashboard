@@ -1,0 +1,776 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+from io import BytesIO
+import xlsxwriter
+from dateutil.relativedelta import relativedelta
+
+st.set_page_config(page_title="급여 정보 조회 툴", layout="wide")
+st.title("📊 급여 정보 조회 툴")
+
+hr_file = st.file_uploader("인사정보 파일 업로드", type=["xlsx", "xls"], key="hr_file")
+uploaded_files = st.file_uploader("급여 엑셀 파일 업로드 (여러 개 가능)", type=["xlsx", "xls"], accept_multiple_files=True)
+
+hr_df = None
+
+if hr_file is not None:
+    try:
+        hr_df = pd.read_excel(hr_file)
+        hr_df.columns = hr_df.columns.astype(str).str.strip()
+        st.success(f"✅ 인사정보 {len(hr_df):,}건 로드 완료")
+    except Exception as e:
+        st.error(f"인사정보 파일 읽기 실패 : {e}")
+
+if uploaded_files:
+
+    df_list = []
+
+    for file in uploaded_files:
+        try:
+            temp_df = pd.read_excel(file, header=1)
+            if "성명" not in temp_df.columns:
+                temp_df = pd.read_excel(file, header=0)
+        except:
+            temp_df = pd.read_excel(file, header=0)
+
+        temp_df.columns = temp_df.columns.astype(str).str.strip()
+        temp_df = temp_df.loc[:, ~temp_df.columns.duplicated()]
+        df_list.append(temp_df)
+
+    df = pd.concat(df_list, ignore_index=True)
+
+    df["급여년월"] = (
+        df["급여년월"]
+        .astype(str)
+        .str.replace(".", "-", regex=False)
+        .str.replace("/", "-", regex=False)
+        .str[:7]
+    )
+
+    st.success(f"✅ {len(df):,}건 데이터 로드 완료")
+
+    tab1, tab2 = st.tabs(["🔎 급여 조회", "💰 퇴직금 산정"])
+
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            ym_list = ["전체"] + sorted(df["급여년월"].dropna().unique())
+            selected_ym = st.selectbox("급여년월 선택", ym_list)
+        with col2:
+            search_value = st.text_input("사번 또는 성명 검색")
+
+        filtered_df = df.copy() if selected_ym == "전체" else df[df["급여년월"] == selected_ym]
+
+        if search_value:
+            filtered_df = filtered_df[
+                filtered_df["사번"].astype(str).str.contains(search_value) |
+                filtered_df["성명"].astype(str).str.contains(search_value)
+            ]
+
+        st.dataframe(filtered_df, use_container_width=True)
+
+    with tab2:
+
+        st.subheader("💰 퇴직금 산정")
+
+        unique_names = sorted(df["성명"].dropna().unique())
+        sel_emp = st.selectbox("대상자 선택", unique_names)
+
+        emp_data = df[df["성명"] == sel_emp].copy()
+
+        if emp_data.empty:
+            st.warning("해당 직원 데이터가 없습니다.")
+            st.stop()
+
+        emp_data.rename(columns={
+            "상여금 1": "상여금1",
+            "상여금 2": "상여금2",
+            "팀장수당": "직책수당(팀장)",
+            "조장수당": "직책수당(조장)",
+            "주거정착금": "주거지원비"
+        }, inplace=True)
+
+        # ======================================
+        # 급여 항목 (식대 / 주거지원비 / 직원소개비 제외)
+        # ======================================
+        pay_cols = [
+            "기본급",
+            "시간외수당(연장,휴일)", "야간가산수당", "휴일가산수당",
+            "육아수당",
+            "기타기본급", "기타(야근)수당",
+            "훈련지원수당", "자격증수당", "무균수당",
+            "직책수당(팀장)", "직책수당(조장)",
+            "동물시험수당", "국가핵심기술수당",
+            "기타수당", "교통비",
+            "상여금1", "상여금2",
+            "차량유지비", "문화활동비", "연차수당"
+        ]
+
+        for col in pay_cols:
+            if col in emp_data.columns:
+                emp_data[col] = pd.to_numeric(
+                    emp_data[col].astype(str).str.replace(",", ""),
+                    errors="coerce"
+                ).fillna(0)
+            else:
+                emp_data[col] = 0
+
+        emp_data[pay_cols] = emp_data[pay_cols].round(0).astype(int)
+        emp_data["연도"] = emp_data["급여년월"].astype(str).str[:4]
+
+        valid_cols = [col for col in pay_cols if col in emp_data.columns]
+
+        pivot = emp_data.pivot_table(
+            index=None, columns="급여년월", values=valid_cols, aggfunc="sum"
+        )
+
+        # ======================================
+        # 화면 표시용 월별 집계 (지급항목 | 합계 | 월1 | 월2 ...)
+        # ======================================
+        st.markdown("### 📊 월별 급여 집계")
+
+        if pivot.empty:
+            st.warning("월별 집계 데이터 없음")
+            display_pivot = pd.DataFrame()
+        else:
+            all_months_sorted_disp = sorted(emp_data["급여년월"].unique())
+
+            display_pivot = pivot.reindex(valid_cols)[all_months_sorted_disp].fillna(0)
+            display_pivot.insert(0, "합계", display_pivot.sum(axis=1))
+            display_pivot.index.name = "지급/공제항목"
+
+            st.dataframe(display_pivot.fillna(0).astype(int))
+
+        # ======================================
+        # 연도별 집계
+        # ======================================
+        report = emp_data.groupby("연도")[valid_cols].sum()
+        report["합계"] = report.sum(axis=1)
+        report = report.reset_index()
+
+        st.markdown("### 📊 연도별 합계")
+        st.dataframe(report)
+
+        total = int(report["합계"].sum())
+        final_pay = math.ceil(total / 12 / 10) * 10
+
+        st.metric("최종 퇴직금", f"{final_pay:,.0f} 원")
+
+        emp_info = None
+        join_date = None
+        retire_date = None
+        settle_date = None
+
+        if hr_df is not None:
+            target = hr_df[hr_df["성명"].astype(str).str.strip() == sel_emp.strip()]
+            if not target.empty:
+                emp_info = target.iloc[0].to_dict()
+                join_date = pd.to_datetime(emp_info.get("입사일"), errors="coerce")
+                retire_date = pd.to_datetime(emp_info.get("퇴사일"), errors="coerce")
+                settle_date = pd.to_datetime(emp_info.get("정산일사"), errors="coerce")
+                if settle_date is None or pd.isna(settle_date):
+                    settle_date = retire_date
+
+        def create_excel():
+
+            output = BytesIO()
+            writer = pd.ExcelWriter(output, engine='xlsxwriter')
+            workbook = writer.book
+
+            title_format = workbook.add_format({
+                'bold': True, 'font_size': 14, 'border': 1,
+                'align': 'center', 'valign': 'vcenter'
+            })
+
+            section_format = workbook.add_format({
+                'bold': True, 'font_size': 10, 'border': 1,
+                'align': 'left', 'valign': 'vcenter', 'bg_color': '#D9D9D9'
+            })
+
+            header_format = workbook.add_format({
+                'bold': True, 'font_size': 10, 'border': 1,
+                'align': 'center', 'valign': 'vcenter', 'bg_color': '#D9D9D9'
+            })
+
+            item_header_format = workbook.add_format({
+                'bold': True, 'font_size': 10, 'border': 1,
+                'align': 'center', 'valign': 'vcenter', 'bg_color': '#FFFF00'
+            })
+
+            # 연도별로 순환 적용할 헤더 색상 (월별집계 시트 월 헤더 구분용)
+            year_header_colors = ['#FCE4D6', '#DDEBF7', '#E2EFDA', '#FFF2CC', '#EDEDED']
+            year_header_formats = [
+                workbook.add_format({
+                    'bold': True, 'font_size': 10, 'border': 1,
+                    'align': 'center', 'valign': 'vcenter', 'bg_color': color
+                })
+                for color in year_header_colors
+            ]
+
+            label_format = workbook.add_format({
+                'bold': True, 'font_size': 10, 'border': 1,
+                'align': 'center', 'valign': 'vcenter', 'bg_color': '#D9D9D9'
+            })
+
+            cell_format = workbook.add_format({
+                'font_size': 10, 'border': 1,
+                'align': 'center', 'valign': 'vcenter'
+            })
+
+            money_format = workbook.add_format({
+                'font_size': 10, 'border': 1,
+                'align': 'right', 'valign': 'vcenter', 'num_format': '#,##0'
+            })
+
+            money_format_dash = workbook.add_format({
+                'font_size': 10, 'border': 1,
+                'align': 'right', 'valign': 'vcenter', 'num_format': '#,##0;-#,##0;"-"'
+            })
+
+            date_format = workbook.add_format({
+                'font_size': 10, 'border': 1,
+                'align': 'center', 'valign': 'vcenter', 'num_format': 'yyyy-mm-dd'
+            })
+
+            def col_letter(n):
+                result = ""
+                while n > 0:
+                    n, r = divmod(n - 1, 26)
+                    result = chr(65 + r) + result
+                return result
+
+            # ======================================
+            # 시트1: 월별집계
+            # A=번호 | B=지급/공제항목 | C=합계 | D~=월별
+            # ======================================
+            mv_sheet = workbook.add_worksheet("월별집계")
+            writer.sheets["월별집계"] = mv_sheet
+
+            all_months_sorted = sorted(emp_data["급여년월"].unique())
+
+            mv_sheet.set_column('A:A', 5)
+            mv_sheet.set_column('B:B', 20)
+            mv_sheet.set_column('C:C', 14)
+            mv_sheet.set_column('D:ZZ', 12)
+
+            mv_sheet.write(0, 0, '', header_format)
+            mv_sheet.write(0, 1, '지급/공제항목', header_format)
+            mv_sheet.write(0, 2, '합계', header_format)
+
+            # 연도별로 다른 헤더 색상 적용
+            year_order = []  # 등장 순서대로 연도 기록
+            for m in all_months_sorted:
+                y = str(m)[:4]
+                if y not in year_order:
+                    year_order.append(y)
+            year_color_map = {
+                y: year_header_formats[i % len(year_header_formats)]
+                for i, y in enumerate(year_order)
+            }
+
+            for mi, m in enumerate(all_months_sorted):
+                y = str(m)[:4]
+                mv_sheet.write(0, 3 + mi, m, year_color_map[y])
+
+            # 항목명 → 엑셀 행번호 매핑 (1-based, 1행=헤더이므로 데이터는 2행부터)
+            item_row_map = {}
+
+            for ri, col in enumerate(valid_cols):
+                excel_row = ri + 1  # 0-based
+
+                item_row_map[col] = excel_row + 1  # 1-based row number
+
+                mv_sheet.write(excel_row, 0, ri + 1, cell_format)
+                mv_sheet.write(excel_row, 1, col, item_header_format)
+
+                # 월별 값
+                for mi, m in enumerate(all_months_sorted):
+                    try:
+                        val = pivot.loc[col, m]
+                    except KeyError:
+                        val = 0
+                    if pd.isna(val):
+                        val = 0
+                    mv_sheet.write(excel_row, 3 + mi, int(val), money_format_dash)
+
+                # 합계 (C열) = SUM(D:해당행 ~ 마지막월)
+                last_month_col = col_letter(3 + len(all_months_sorted))
+                mv_sheet.write_formula(
+                    excel_row, 2,
+                    f"=SUM(D{excel_row+1}:{last_month_col}{excel_row+1})",
+                    money_format_dash
+                )
+
+            total_row_idx = len(valid_cols) + 1  # 0-based
+            mv_sheet.write(total_row_idx, 0, '', header_format)
+            mv_sheet.write(total_row_idx, 1, '합계', header_format)
+
+            # 합계열(C) 합계
+            mv_sheet.write_formula(
+                total_row_idx, 2,
+                f"=SUM(C2:C{total_row_idx})",
+                money_format_dash
+            )
+
+            # 월별(D~) 합계
+            for mi in range(len(all_months_sorted)):
+                c = col_letter(4 + mi)
+                mv_sheet.write_formula(
+                    total_row_idx, 3 + mi,
+                    f"=SUM({c}2:{c}{total_row_idx})",
+                    money_format_dash
+                )
+
+            # ======================================
+            # 연도별 열 범위 계산
+            # ======================================
+            sorted_years = sorted(report["연도"].unique())
+
+            def get_year_col_range(year):
+                year_months = [m for m in all_months_sorted if str(m).startswith(str(year))]
+                if not year_months:
+                    return None, None
+                first_idx = all_months_sorted.index(year_months[0]) + 4  # D열부터(1-based)
+                last_idx = all_months_sorted.index(year_months[-1]) + 4
+                return col_letter(first_idx), col_letter(last_idx)
+
+            # ======================================
+            # 시트2: 연도별
+            # ======================================
+            yr_sheet = workbook.add_worksheet("연도별")
+            writer.sheets["연도별"] = yr_sheet
+
+            yr_sheet.write(0, 0, "연도", header_format)
+            for ci, col in enumerate(valid_cols):
+                yr_sheet.write(0, ci + 1, col, header_format)
+            yr_sheet.write(0, len(valid_cols) + 1, "합계", header_format)
+
+            for ri, year in enumerate(sorted_years):
+                excel_row = ri + 1
+                yr_sheet.write(excel_row, 0, year, cell_format)
+
+                start_col, end_col = get_year_col_range(year)
+
+                for ci, col in enumerate(valid_cols):
+                    item_excel_row = item_row_map.get(col)
+                    if item_excel_row and start_col and end_col:
+                        formula = f"=SUM(월별집계!${start_col}${item_excel_row}:${end_col}${item_excel_row})"
+                        yr_sheet.write_formula(excel_row, ci + 1, formula, money_format)
+                    else:
+                        yr_sheet.write(excel_row, ci + 1, 0, money_format)
+
+                sum_refs = "+".join([
+                    f"{col_letter(ci2 + 2)}{excel_row + 1}"
+                    for ci2, c in enumerate(valid_cols)
+                ])
+                yr_sheet.write_formula(excel_row, len(valid_cols) + 1, f"={sum_refs}", money_format)
+
+            total_yr_row = len(sorted_years) + 1
+            yr_sheet.write(total_yr_row, 0, "합계", header_format)
+            for ci in range(len(valid_cols) + 1):
+                c = col_letter(ci + 2)
+                yr_sheet.write_formula(
+                    total_yr_row, ci + 1,
+                    f"=SUM({c}2:{c}{total_yr_row})",
+                    money_format
+                )
+
+            yr_col_map = {col: ci + 2 for ci, col in enumerate(valid_cols)}
+            합계_col = len(valid_cols) + 2
+
+            # ======================================
+            # 시트3: 퇴직금
+            # ======================================
+            sheet = workbook.add_worksheet("퇴직금")
+            writer.sheets["퇴직금"] = sheet
+
+            sheet.set_column('A:A', 8)
+            sheet.set_column('B:B', 8)
+            sheet.set_column('C:C', 12)
+            sheet.set_column('D:D', 12)
+            sheet.set_column('E:E', 12)
+            sheet.set_column('F:F', 12)
+            sheet.set_column('G:G', 12)
+            sheet.set_column('H:H', 14)
+            sheet.set_row(0, 30)
+
+            sheet.merge_range('A1:H1', '퇴직금 산정', title_format)
+            sheet.merge_range('A2:H2', '1. 퇴사자 인적 사항', section_format)
+
+            sheet.write('A3', '사번', label_format)
+            sheet.write('B3', emp_info.get('사번', '') if emp_info else '', cell_format)
+            sheet.write('C3', '성명', label_format)
+            sheet.write('D3', emp_info.get('성명', '') if emp_info else '', cell_format)
+            sheet.write('E3', '부서', label_format)
+            sheet.write('F3', emp_info.get('부서명', '') if emp_info else '', cell_format)
+            sheet.write('G3', '직급', label_format)
+            sheet.write('H3', emp_info.get('직급명', '') if emp_info else '', cell_format)
+
+            sheet.write('A4', '정산입사', label_format)
+            if join_date is not None and pd.notna(join_date):
+                sheet.write_datetime('B4', join_date.to_pydatetime(), date_format)
+            else:
+                sheet.write('B4', '', cell_format)
+
+            sheet.write('C4', '정산퇴사', label_format)
+            if settle_date is not None and pd.notna(settle_date):
+                sheet.write_datetime('D4', settle_date.to_pydatetime(), date_format)
+            else:
+                sheet.write('D4', '', cell_format)
+
+            sheet.write('E4', '근속년수', label_format)
+            sheet.write_formula('F4', '=IFERROR(DATEDIF(B4,D4+1,"Y")&"년","")', cell_format)
+            sheet.write('G4', '근속월수', label_format)
+            sheet.write_formula('H4', '=IFERROR(DATEDIF(B4,D4+1,"M")&"개월","")', cell_format)
+
+            sheet.write('A5', '입사일', label_format)
+            if join_date is not None and pd.notna(join_date):
+                sheet.write_datetime('B5', join_date.to_pydatetime(), date_format)
+            else:
+                sheet.write('B5', '', cell_format)
+
+            sheet.write('C5', '근속일수', label_format)
+            sheet.write_formula('D5', '=IFERROR(DATEDIF(B4,D4+1,"D")&"일","")', cell_format)
+            sheet.write('E5', '근속기간', label_format)
+            sheet.write_formula('F5', '=IFERROR(DATEDIF(B4,D4+1,"Y")&"년 "&DATEDIF(B4,D4+1,"YM")&"개월 "&DATEDIF(B4,D4+1,"MD")&"일","")', cell_format)
+            sheet.write('G5', '제외월수', label_format)
+            sheet.write('H5', '', cell_format)
+
+            sheet.merge_range('A7:H7', '2. 퇴직금 산정내역', section_format)
+            sheet.merge_range('A8:B8', '지급내역', header_format)
+            sheet.merge_range('C8:D8', '금액', header_format)
+            sheet.merge_range('E8:F8', '공제내역', header_format)
+            sheet.merge_range('G8:H8', '금액', header_format)
+
+            pay_items = ['퇴직금', '퇴직보험금', '명예퇴직금', '비과세소득', '특별퇴직금']
+            deduct_items = ['소득세', '지방소득세', '', '', '']
+
+            for idx in range(5):
+                row_no = 8 + idx
+                sheet.merge_range(row_no, 0, row_no, 1, pay_items[idx], cell_format)
+                if idx == 0:
+                    sheet.merge_range(row_no, 2, row_no, 3, final_pay, money_format)
+                else:
+                    sheet.merge_range(row_no, 2, row_no, 3, '', money_format)
+                sheet.merge_range(row_no, 4, row_no, 5, deduct_items[idx], cell_format)
+                sheet.merge_range(row_no, 6, row_no, 7, '', money_format)
+
+            sheet.merge_range('A14:B14', '지급합계', header_format)
+            sheet.merge_range('C14:D14', final_pay, money_format)
+            sheet.merge_range('E14:F14', '공제합계', header_format)
+            sheet.merge_range('G14:H14', 0, money_format)
+            sheet.merge_range('A15:B15', '차인지급액', header_format)
+            sheet.merge_range('C15:H15', final_pay, money_format)
+
+            # ======================================
+            # 3. 퇴직급여 산정내역 (A+B 병합 기간, C~H)
+            # ======================================
+            sheet.merge_range('A17:H17', '3. 퇴직급여 산정내역', section_format)
+
+            sheet.merge_range(17, 0, 18, 1, '지급항목\n기간', header_format)
+            sheet.write(17, 2, '기본급', header_format)
+            sheet.write(17, 3, '연장근로수당', header_format)
+            sheet.write(17, 4, '야간근로수당', header_format)
+            sheet.write(17, 5, '휴일근로수당', header_format)
+            sheet.write(17, 6, '육아수당', header_format)
+            sheet.merge_range(17, 7, 18, 7, '합계', header_format)
+
+            sheet.write(18, 2, '차량유지비', header_format)
+            sheet.write(18, 3, '기타기본급', header_format)
+            sheet.write(18, 4, '기타야근수당', header_format)
+            sheet.write(18, 5, '연차수당', header_format)
+            sheet.write(18, 6, '기타', header_format)
+            sheet.write(18, 7, '', header_format)
+
+            def yr_ref(col_name, yr_excel_row):
+                c = yr_col_map.get(col_name)
+                if c:
+                    return f"=연도별!{col_letter(c)}${yr_excel_row}"
+                return "=0"
+
+            def bonus_formula(yr_excel_row):
+                cols_to_sub = ['기본급', '시간외수당(연장,휴일)', '야간가산수당', '휴일가산수당',
+                               '육아수당', '차량유지비', '기타기본급', '기타(야근)수당', '연차수당']
+                sub = "".join([
+                    f"-연도별!{col_letter(yr_col_map[c])}${yr_excel_row}"
+                    for c in cols_to_sub if c in yr_col_map
+                ])
+                return f"=연도별!{col_letter(합계_col)}${yr_excel_row}{sub}"
+
+            curr_row = 19
+            upper_rows = []  # 윗줄 (기본급, 연장, 야간, 휴일, 육아) 엑셀 행번호 (1-based)
+            lower_rows = []  # 아랫줄 (차량유지비, 기타기본금, 기타야근수당, 연차수당, 기타) 엑셀 행번호 (1-based)
+
+            for i, year in enumerate(sorted_years):
+                yr_excel_row = i + 2
+
+                if join_date is not None and pd.notna(join_date) and i == 0:
+                    start_str = join_date.strftime('%Y-%m-%d')
+                else:
+                    start_str = f"{year}-01-01"
+
+                if retire_date is not None and pd.notna(retire_date) and i == len(sorted_years) - 1:
+                    end_str = retire_date.strftime('%Y-%m-%d')
+                else:
+                    end_str = f"{year}-12-31"
+
+                period_text = f"{start_str}~{end_str}"
+
+                sheet.merge_range(curr_row, 0, curr_row + 1, 1, period_text, cell_format)
+
+                sheet.write_formula(curr_row, 2, yr_ref('기본급', yr_excel_row), money_format)
+                sheet.write_formula(curr_row, 3, yr_ref('시간외수당(연장,휴일)', yr_excel_row), money_format)
+                sheet.write_formula(curr_row, 4, yr_ref('야간가산수당', yr_excel_row), money_format)
+                sheet.write_formula(curr_row, 5, yr_ref('휴일가산수당', yr_excel_row), money_format)
+                sheet.write_formula(curr_row, 6, yr_ref('육아수당', yr_excel_row), money_format)
+                upper_excel_row = curr_row + 1  # 1-based
+                lower_excel_row = curr_row + 2  # 1-based
+
+                sheet.write_formula(curr_row + 1, 2, yr_ref('차량유지비', yr_excel_row), money_format)
+                sheet.write_formula(curr_row + 1, 3, yr_ref('기타기본급', yr_excel_row), money_format)
+                sheet.write_formula(curr_row + 1, 4, yr_ref('기타(야근)수당', yr_excel_row), money_format)
+                sheet.write_formula(curr_row + 1, 5, yr_ref('연차수당', yr_excel_row), money_format)
+                sheet.write_formula(curr_row + 1, 6, bonus_formula(yr_excel_row), money_format)
+
+                # H열 합계 (같은 표 내 C~G 윗줄+아랫줄 합)
+                row_h_formula = f"SUM(C{upper_excel_row}:G{upper_excel_row})+SUM(C{lower_excel_row}:G{lower_excel_row})"
+                sheet.merge_range(
+                    curr_row, 7, curr_row + 1, 7,
+                    f"={row_h_formula}",
+                    money_format
+                )
+
+                upper_rows.append(upper_excel_row)
+                lower_rows.append(lower_excel_row)
+
+                curr_row += 2
+
+            # ======================================
+            # 합계 행 (같은 표 내 데이터 행들을 SUM, 연도 늘어나도 자동 반영)
+            # ======================================
+            sheet.merge_range(curr_row, 0, curr_row + 1, 1, '합계', header_format)
+
+            def sum_rows_formula(col_idx, rows):
+                col_l = col_letter(col_idx + 1)  # col_idx는 0-based, col_letter는 1-based
+                refs = "+".join([f"{col_l}{r}" for r in rows])
+                return f"={refs}" if refs else "=0"
+
+            sheet.write_formula(curr_row, 2, sum_rows_formula(2, upper_rows), money_format)
+            sheet.write_formula(curr_row, 3, sum_rows_formula(3, upper_rows), money_format)
+            sheet.write_formula(curr_row, 4, sum_rows_formula(4, upper_rows), money_format)
+            sheet.write_formula(curr_row, 5, sum_rows_formula(5, upper_rows), money_format)
+            sheet.write_formula(curr_row, 6, sum_rows_formula(6, upper_rows), money_format)
+
+            # 합계(H열) = 윗줄 합계열들의 합 (각 연도 블록의 H값은 윗줄에 병합되어 있음)
+            sheet.merge_range(
+                curr_row, 7, curr_row + 1, 7,
+                sum_rows_formula(7, upper_rows),
+                money_format
+            )
+
+            sheet.write_formula(curr_row + 1, 2, sum_rows_formula(2, lower_rows), money_format)
+            sheet.write_formula(curr_row + 1, 3, sum_rows_formula(3, lower_rows), money_format)
+            sheet.write_formula(curr_row + 1, 4, sum_rows_formula(4, lower_rows), money_format)
+            sheet.write_formula(curr_row + 1, 5, sum_rows_formula(5, lower_rows), money_format)
+            sheet.write_formula(curr_row + 1, 6, sum_rows_formula(6, lower_rows), money_format)
+
+            # ======================================
+            # 하단 요약
+            # ======================================
+            total_yr_excel_row = len(sorted_years) + 2  # 연도별 시트 합계행 번호 (발송용 시트에서 참조)
+            total_h_row = curr_row + 1  # 합계 행의 1-based 엑셀 행번호 (H열 병합 시작행)
+            bottom_row = curr_row + 3
+            산정합계_formula = f"={col_letter(8)}{total_h_row}"
+
+            sheet.merge_range(bottom_row, 0, bottom_row, 1, '산정급여', header_format)
+            sheet.merge_range(bottom_row, 2, bottom_row, 3, '산정상여금', header_format)
+            sheet.merge_range(bottom_row, 4, bottom_row, 5, '합계', header_format)
+            sheet.merge_range(bottom_row, 6, bottom_row, 7, '퇴직금', header_format)
+
+            sheet.merge_range(bottom_row + 1, 0, bottom_row + 1, 1, 0, money_format)
+            sheet.write_formula(bottom_row + 1, 0, 산정합계_formula, money_format)
+            sheet.merge_range(bottom_row + 1, 2, bottom_row + 1, 3, '', money_format)
+            sheet.merge_range(bottom_row + 1, 4, bottom_row + 1, 5, 0, money_format)
+            sheet.write_formula(bottom_row + 1, 4, 산정합계_formula, money_format)
+            sheet.merge_range(bottom_row + 1, 6, bottom_row + 1, 7, final_pay, money_format)
+
+            # ======================================
+            # 발송용 시트
+            # ======================================
+
+            send_sheet = workbook.add_worksheet("발송용")
+            writer.sheets["발송용"] = send_sheet
+
+            send_sheet.set_column('A:A', 8)
+            send_sheet.set_column('B:B', 8)
+            send_sheet.set_column('C:C', 12)
+            send_sheet.set_column('D:D', 12)
+            send_sheet.set_column('E:E', 12)
+            send_sheet.set_column('F:F', 12)
+            send_sheet.set_column('G:G', 12)
+            send_sheet.set_column('H:H', 14)
+
+            send_sheet.merge_range('A1:H1', '퇴직금 산정', title_format)
+
+            send_sheet.merge_range('A2:H2', '1. 퇴사자 인적 사항', section_format)
+
+            send_sheet.write('A3', '사번', label_format)
+            send_sheet.write('B3', emp_info.get('사번', '') if emp_info else '', cell_format)
+            send_sheet.write('C3', '성명', label_format)
+            send_sheet.write('D3', emp_info.get('성명', '') if emp_info else '', cell_format)
+            send_sheet.write('E3', '부서', label_format)
+            send_sheet.write('F3', emp_info.get('부서명', '') if emp_info else '', cell_format)
+            send_sheet.write('G3', '직급', label_format)
+            send_sheet.write('H3', emp_info.get('직급명', '') if emp_info else '', cell_format)
+
+            send_sheet.write('A4', '정산입사', label_format)
+            if join_date is not None and pd.notna(join_date):
+                send_sheet.write_datetime('B4', join_date.to_pydatetime(), date_format)
+            else:
+                send_sheet.write('B4', '', cell_format)
+
+            send_sheet.write('C4', '정산퇴사', label_format)
+            if settle_date is not None and pd.notna(settle_date):
+                send_sheet.write_datetime('D4', settle_date.to_pydatetime(), date_format)
+            else:
+                send_sheet.write('D4', '', cell_format)
+
+            send_sheet.write('E4', '근속년수', label_format)
+            send_sheet.write_formula('F4', '=IFERROR(DATEDIF(B4,D4+1,"Y")&"년","")', cell_format)
+            send_sheet.write('G4', '근속월수', label_format)
+            send_sheet.write_formula('H4', '=IFERROR(DATEDIF(B4,D4+1,"M")&"개월","")', cell_format)
+
+            send_sheet.write('A5', '입사일', label_format)
+            if join_date is not None and pd.notna(join_date):
+                send_sheet.write_datetime('B5', join_date.to_pydatetime(), date_format)
+            else:
+                send_sheet.write('B5', '', cell_format)
+
+            send_sheet.write('C5', '근속일수', label_format)
+            send_sheet.write_formula('D5', '=IFERROR(DATEDIF(B4,D4+1,"D")&"일","")', cell_format)
+            send_sheet.write('E5', '근속기간', label_format)
+            send_sheet.write_formula(
+                'F5',
+                '=IFERROR(DATEDIF(B4,D4+1,"Y")&"년 "&DATEDIF(B4,D4+1,"YM")&"개월 "&DATEDIF(B4,D4+1,"MD")&"일","")',
+                cell_format
+            )
+            send_sheet.write('G5', '제외월수', label_format)
+            send_sheet.write('H5', '', cell_format)
+
+            send_sheet.merge_range('A7:H7', '2. 퇴직금 산정내역', section_format)
+            send_sheet.merge_range('A8:B8', '지급내역', header_format)
+            send_sheet.merge_range('C8:D8', '금액', header_format)
+            send_sheet.merge_range('E8:F8', '공제내역', header_format)
+            send_sheet.merge_range('G8:H8', '금액', header_format)
+
+            for idx in range(5):
+                row_no = 8 + idx
+
+                send_sheet.merge_range(row_no, 0, row_no, 1, pay_items[idx], cell_format)
+
+                if idx == 0:
+                    send_sheet.merge_range(row_no, 2, row_no, 3, final_pay, money_format)
+                else:
+                    send_sheet.merge_range(row_no, 2, row_no, 3, '', money_format)
+
+                send_sheet.merge_range(row_no, 4, row_no, 5, deduct_items[idx], cell_format)
+                send_sheet.merge_range(row_no, 6, row_no, 7, '', money_format)
+
+            send_sheet.merge_range('A14:B14', '지급합계', header_format)
+            send_sheet.merge_range('C14:D14', final_pay, money_format)
+            send_sheet.merge_range('E14:F14', '공제합계', header_format)
+            send_sheet.merge_range('G14:H14', 0, money_format)
+
+            send_sheet.merge_range('A15:B15', '차인지급액', header_format)
+            send_sheet.merge_range('C15:H15', final_pay, money_format)
+
+            send_sheet.merge_range('A17:H17', '3. 퇴직급여 산정내역', section_format)
+
+            send_sheet.merge_range('A18:D18', '기간', header_format)
+            send_sheet.merge_range('E18:H18', '지급합계', header_format)
+
+            row = 18
+
+            for i, year in enumerate(sorted_years):
+
+                yr_excel_row = i + 2
+
+                if join_date is not None and pd.notna(join_date) and i == 0:
+                    start_str = join_date.strftime('%Y-%m-%d')
+                else:
+                    start_str = f"{year}-01-01"
+
+                if retire_date is not None and pd.notna(retire_date) and i == len(sorted_years) - 1:
+                    end_str = retire_date.strftime('%Y-%m-%d')
+                else:
+                    end_str = f"{year}-12-31"
+
+                period_text = f"{start_str}~{end_str}"
+
+                send_sheet.merge_range(row, 0, row, 3, period_text, cell_format)
+
+                send_sheet.merge_range(
+                    row, 4, row, 7,
+                    f"=연도별!{col_letter(합계_col)}${yr_excel_row}",
+                    money_format
+                )
+
+                row += 1
+
+            send_sheet.merge_range(row, 0, row, 3, '합계', header_format)
+
+            send_sheet.merge_range(
+                row, 4, row, 7,
+                f"=연도별!{col_letter(합계_col)}${total_yr_excel_row}",
+                money_format
+            )
+
+            bottom_row2 = row + 2
+
+            send_sheet.merge_range(bottom_row2, 0, bottom_row2, 1, '산정급여', header_format)
+            send_sheet.merge_range(bottom_row2, 2, bottom_row2, 3, '산정상여금', header_format)
+            send_sheet.merge_range(bottom_row2, 4, bottom_row2, 5, '합계', header_format)
+            send_sheet.merge_range(bottom_row2, 6, bottom_row2, 7, '퇴직금', header_format)
+
+            send_sheet.merge_range(
+                bottom_row2 + 1, 0, bottom_row2 + 1, 1,
+                f"=연도별!{col_letter(합계_col)}${total_yr_excel_row}",
+                money_format
+            )
+
+            send_sheet.merge_range(
+                bottom_row2 + 1, 2, bottom_row2 + 1, 3,
+                '',
+                money_format
+            )
+
+            send_sheet.merge_range(
+                bottom_row2 + 1, 4, bottom_row2 + 1, 5,
+                f"=연도별!{col_letter(합계_col)}${total_yr_excel_row}",
+                money_format
+            )
+
+            send_sheet.merge_range(
+                bottom_row2 + 1, 6, bottom_row2 + 1, 7,
+                final_pay,
+                money_format
+            )
+
+            writer.close()
+            return output.getvalue()
+
+        try:
+            excel_data = create_excel()
+            st.success("엑셀 생성 성공")
+            st.download_button(
+                label="📥 퇴직금 산정 내역 다운로드",
+                data=excel_data,
+                file_name=f"{sel_emp}_퇴직금산정.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"에러 발생: {e}")
+
+else:
+    st.info("📂 급여 엑셀 파일을 업로드해주세요.")
