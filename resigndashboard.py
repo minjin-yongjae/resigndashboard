@@ -774,5 +774,3 @@ if uploaded_files:
 
 else:
     st.info("📂 급여 엑셀 파일을 업로드해주세요.")
-
-streamlit run resigndashboard.py
